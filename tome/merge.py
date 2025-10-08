@@ -18,8 +18,7 @@ def do_nothing(x, mode=None):
 def bipartite_soft_matching(
     metric: torch.Tensor,
     r: int,
-    class_token: bool = False,
-    distill_token: bool = False,
+    num_special_tokens: int = 5,
 ) -> Tuple[Callable, Callable]:
     """
     Applies ToMe with a balanced matching set (50%, 50%).
@@ -33,15 +32,10 @@ def bipartite_soft_matching(
 
     When enabled, the class token and distillation tokens won't get merged.
     """
-    protected = 0
-    if class_token:
-        protected += 1
-    if distill_token:
-        protected += 1
 
     # We can only reduce by a maximum of 50% tokens
-    t = metric.shape[1]
-    r = min(r, (t - protected) // 2)
+    t = metric.shape[-2]
+    r = min(r, (t - num_special_tokens) // 2)
 
     if r <= 0:
         return do_nothing, do_nothing
@@ -51,55 +45,59 @@ def bipartite_soft_matching(
         a, b = metric[..., ::2, :], metric[..., 1::2, :]
         scores = a @ b.transpose(-1, -2)
 
-        if class_token:
-            scores[..., 0, :] = -math.inf
-        if distill_token:
-            scores[..., :, 0] = -math.inf
+        scores[..., :num_special_tokens, :] = -math.inf
 
         node_max, node_idx = scores.max(dim=-1)
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
-        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
-        src_idx = edge_idx[..., :r, :]  # Merged Tokens
-        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)
+        unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens: ..., t/2 - r, 1
+        src_idx = edge_idx[..., :r, :]  # Merged Tokens: ..., r, 1
+        dst_idx = node_idx[..., None].gather(dim=-2, index=src_idx)  # ..., r, 1
 
-        if class_token:
+        if num_special_tokens >= 1:
             # Sort to ensure the class token is at the start
             unm_idx = unm_idx.sort(dim=1)[0]
 
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
-        n, t1, c = src.shape
-        unm = src.gather(dim=-2, index=unm_idx.expand(n, t1 - r, c))
-        src = src.gather(dim=-2, index=src_idx.expand(n, r, c))
-        dst = dst.scatter_reduce(-2, dst_idx.expand(n, r, c), src, reduce=mode)
 
-        if distill_token:
-            return torch.cat([unm[:, :1], dst[:, :1], unm[:, 1:], dst[:, 1:]], dim=1)
-        else:
-            return torch.cat([unm, dst], dim=1)
+        unm_size = list(src.shape)
+        unm_size[-2] = src.shape[-2] - r  # Unmerged Token
+
+        unm = src.gather(dim=-2, index=unm_idx.expand(*unm_size))  # ..., t/2 - r, c
+        if mode != "prune":
+            dst_size = list(src.shape)
+            dst_size[-2] = r  # Merged Token
+            src = src.gather(dim=-2, index=src_idx.expand(*dst_size))  # ..., r, c
+            dst = dst.scatter_reduce(-2, dst_idx.expand(*dst_size), src, reduce=mode)  # ..., t/2, c
+
+        return torch.cat([unm, dst], dim=-2)
 
     def unmerge(x: torch.Tensor) -> torch.Tensor:
-        unm_len = unm_idx.shape[1]
+        unm_len = unm_idx.shape[-2]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
-        n, _, c = unm.shape
 
-        src = dst.gather(dim=-2, index=dst_idx.expand(n, r, c))
+        rc_size = list(x.shape)
+        rc_size[-2] = r
+        src = dst.gather(dim=-2, index=dst_idx.expand(*rc_size))
 
-        out = torch.zeros(n, metric.shape[1], c, device=x.device, dtype=x.dtype)
+        out_size = list(x.shape)
+        out_size[-2] = metric.shape[-2]
+        out = torch.zeros(*out_size, device=x.device, dtype=x.dtype)
 
         out[..., 1::2, :] = dst
-        out.scatter_(dim=-2, index=(2 * unm_idx).expand(n, unm_len, c), src=unm)
-        out.scatter_(dim=-2, index=(2 * src_idx).expand(n, r, c), src=src)
+
+        unm_size = list(x.shape)
+        unm_size[-2] = unm_len
+        out.scatter_(dim=-2, index=(2 * unm_idx).expand(*unm_size), src=unm)
+        out.scatter_(dim=-2, index=(2 * src_idx).expand(*rc_size), src=src)
 
         return out
 
     return merge, unmerge
 
 
-def kth_bipartite_soft_matching(
-    metric: torch.Tensor, k: int
-) -> Tuple[Callable, Callable]:
+def kth_bipartite_soft_matching(metric: torch.Tensor, k: int) -> Tuple[Callable, Callable]:
     """
     Applies ToMe with the two sets as (every kth element, the rest).
     If n is the number of tokens, resulting number of tokens will be n // z.
@@ -153,9 +151,7 @@ def kth_bipartite_soft_matching(
     return merge, unmerge
 
 
-def random_bipartite_soft_matching(
-    metric: torch.Tensor, r: int
-) -> Tuple[Callable, Callable]:
+def random_bipartite_soft_matching(metric: torch.Tensor, r: int) -> Tuple[Callable, Callable]:
     """
     Applies ToMe with the two sets as (r chosen randomly, the rest).
     Input size is [batch, tokens, channels].
@@ -207,9 +203,7 @@ def random_bipartite_soft_matching(
     return merge, unmerge
 
 
-def merge_wavg(
-    merge: Callable, x: torch.Tensor, size: torch.Tensor = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def merge_wavg(merge: Callable, x: torch.Tensor, size: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies the merge function by taking a weighted average based on token size.
     Returns the merged tensor and the new token sizes.
@@ -224,16 +218,14 @@ def merge_wavg(
     return x, size
 
 
-def merge_source(
-    merge: Callable, x: torch.Tensor, source: torch.Tensor = None
-) -> torch.Tensor:
+def merge_source(merge: Callable, x: torch.Tensor, source: torch.Tensor = None) -> torch.Tensor:
     """
     For source tracking. Source is an adjacency matrix between the initial tokens and final merged groups.
     x is used to find out how many tokens there are in case the source is None.
     """
     if source is None:
-        n, t, _ = x.shape
-        source = torch.eye(t, device=x.device)[None, ...].expand(n, t, t)
+        t = x.shape[-2]
+        source = torch.eye(t, device=x.device)[None, ...].expand(*x.shape[:-1], t)
 
     source = merge(source, mode="amax")
     return source
