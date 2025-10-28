@@ -5,7 +5,7 @@ from dinov3.layers.block import SelfAttentionBlock
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
 from spatial_tome.merge import spatial_soft_matching
-from tome.utils import parse_r
+from tome.utils import parse_r, PatchedDinov3
 
 
 class SpatialToMeBlock(SelfAttentionBlock):
@@ -102,6 +102,7 @@ def apply_patch(model: DinoVisionTransformer):
     """
     SpatialToMeVisionTransformer = make_spatial_tome_class(model.__class__)
 
+    model.backbone.__class__ = PatchedDinov3
     model.__class__ = SpatialToMeVisionTransformer
     model.r = 0
     model._tome_info = {

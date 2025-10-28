@@ -3,10 +3,9 @@ from torch import Tensor
 
 from dinov3.layers.block import SelfAttentionBlock
 from dinov3.layers.attention import SelfAttention
-from dinov3.models.vision_transformer import DinoVisionTransformer
 
 from tome.merge import bipartite_soft_matching, merge_source, merge_wavg
-from tome.utils import parse_r
+from tome.utils import parse_r, PatchedDinov3
 
 
 class ToMeBlock(SelfAttentionBlock):
@@ -121,7 +120,7 @@ def make_tome_class(transformer_class):
     return ToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, prop_attn: bool = True):
+def apply_patch(model, trace_source: bool = False, prop_attn: bool = True):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
@@ -129,10 +128,11 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, prop_a
     The sources will be available at model._tome_info["source"] afterward.
 
     For proportional attention, set prop_attn to True. This is only necessary when evaluating models off
-    the shelf. For trianing and for evaluating MAE models off the self set this to be False.
+    the shelf. For training and for evaluating MAE models off the self set this to be False.
     """
     ToMeVisionTransformer = make_tome_class(model.__class__)
 
+    model.backbone.__class__ = PatchedDinov3
     model.__class__ = ToMeVisionTransformer
     model.r = 0
     model._tome_info = {
