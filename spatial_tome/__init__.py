@@ -5,7 +5,6 @@
 # LICENSE file in the root directory of this source tree.
 # --------------------------------------------------------
 
-from . import merge, patch, patch_block, patch_pre, patch_separate, utils
-from .vis import make_visualization
+from . import merge, patch_block
 
-__all__ = ["utils", "merge", "patch", "patch_block", "patch_pre", "patch_separate", "make_visualization"]
+__all__ = ["merge", "patch_block"]

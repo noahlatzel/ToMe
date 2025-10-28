@@ -1,6 +1,8 @@
+
+
 # Token Merging: Your ViT but Faster
 
-Official PyTorch implemention of **ToMe** from our paper: [Token Merging: Your ViT but Faster](https://arxiv.org/abs/2210.09461).  
+This is a fork of the official **ToMe** PyTorch implementation: [Token Merging: Your ViT but Faster](https://arxiv.org/abs/2210.09461) that implements ToMe for DINOv3 and with an arbitrary number of leading dimensions (useful for merging keys, query, values).  
 Daniel Bolya, Cheng-Yang Fu, Xiaoliang Dai, Peizhao Zhang, Christoph Feichtenhofer, Judy Hoffman.
 
 ## What is ToMe?
