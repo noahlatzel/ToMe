@@ -5,7 +5,7 @@ from dinov3.layers.block import SelfAttentionBlock
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
 from spatial_tome.merge import spatial_soft_matching
-from tome.utils import parse_r, PatchedDinov3
+from tome.utils import parse_r, PatchedDinov3, init_source_if_needed
 
 
 class SpatialToMeBlock(SelfAttentionBlock):
@@ -28,6 +28,12 @@ class SpatialToMeBlock(SelfAttentionBlock):
                     r,
                     self._tome_info["num_special_tokens"],
                 )
+
+                if self._tome_info.get("trace_source", False):
+                    source = init_source_if_needed(x, self._tome_info.get("source"))
+                    source = merge(source, mode="mean")
+                    self._tome_info["source"] = source
+
                 x = merge(x, mode="mean")
 
                 sin, cos = rope
@@ -65,6 +71,9 @@ class SpatialToMeBlock(SelfAttentionBlock):
                 # Unmerge
                 x = unmerge(x)
 
+                if self._tome_info.get("trace_source", False):
+                    self._tome_info["source"] = unmerge(self._tome_info["source"])
+
             x_out.append(x)
         x_ffn = x_out
 
@@ -81,6 +90,9 @@ def make_spatial_tome_class(transformer_class):
         def forward(self, x, *args, **kwdargs) -> torch.Tensor:
             self._tome_info["r"] = parse_r(len(self.backbone.blocks), self.r)
             self._tome_info["size"] = None
+            if self._tome_info.get("trace_source", False):
+                self._tome_info["source"] = None
+
             _, _, H, W = x.shape
             self._tome_info["H"] = H // self.backbone.patch_size
             self._tome_info["W"] = W // self.backbone.patch_size
@@ -90,7 +102,7 @@ def make_spatial_tome_class(transformer_class):
     return SpatialToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer):
+def apply_patch(model: DinoVisionTransformer, trace_source: bool = False):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
@@ -108,6 +120,8 @@ def apply_patch(model: DinoVisionTransformer):
     model._tome_info = {
         "r": model.r,
         "num_special_tokens": model.backbone.n_storage_tokens + 1,
+        "trace_source": trace_source,
+        "source": None,
     }
 
     for module in model.modules():

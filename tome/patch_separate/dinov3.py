@@ -5,7 +5,7 @@ from dinov3.layers.block import SelfAttentionBlock
 from dinov3.layers.attention import SelfAttention
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
-from tome.merge import bipartite_soft_matching
+from tome.merge import bipartite_soft_matching, merge_source
 from tome.utils import parse_r, PatchedDinov3
 
 
@@ -23,6 +23,8 @@ class ToMeBlock(SelfAttentionBlock):
             x_norm1 = self.norm1(x)
             x_attn, merge, size, size_original = self.attn(x_norm1, rope=rope)
             if size is not None:
+                if self._tome_info["trace_source"]:
+                    self._tome_info["source"] = merge_source(merge, x, self._tome_info["source"])
                 x = merge(x * size_original, mode="sum")
                 x = x / size
             x = x + self.ls1(x_attn)
@@ -178,6 +180,7 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, prop_a
     for module in model.modules():
         if isinstance(module, SelfAttentionBlock):
             module.__class__ = ToMeBlock
+            module._tome_info = model._tome_info
         elif isinstance(module, SelfAttention):
             module.__class__ = ToMeAttention
             module._tome_info = model._tome_info

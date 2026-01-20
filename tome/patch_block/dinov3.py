@@ -5,7 +5,7 @@ from dinov3.layers.block import SelfAttentionBlock
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
 from tome.merge import bipartite_soft_matching
-from tome.utils import parse_r, PatchedDinov3
+from tome.utils import parse_r, PatchedDinov3, init_source_if_needed
 
 
 class ToMeBlock(SelfAttentionBlock):
@@ -17,7 +17,7 @@ class ToMeBlock(SelfAttentionBlock):
         """
         r = self._tome_info["r"].pop(0)
 
-        x_out = []
+        x_out: list[Tensor] = []
         for x, rope in zip(x_list, rope_list):
             if r > 0:
                 # Apply ToMe here
@@ -26,6 +26,12 @@ class ToMeBlock(SelfAttentionBlock):
                     r,
                     self._tome_info["num_special_tokens"],
                 )
+
+                if self._tome_info.get("trace_source", False):
+                    source = init_source_if_needed(x, self._tome_info.get("source"))
+                    source = merge(source, mode="mean")
+                    self._tome_info["source"] = source
+
                 x = merge(x, mode="mean")
 
                 sin, cos = rope
@@ -63,6 +69,11 @@ class ToMeBlock(SelfAttentionBlock):
                 # Unmerge
                 x = unmerge(x)
 
+                if self._tome_info.get("trace_source", False):
+                    source = self._tome_info.get("source")
+                    if source is not None:
+                        self._tome_info["source"] = unmerge(source)
+
             x_out.append(x)
         x_ffn = x_out
 
@@ -78,25 +89,21 @@ def make_tome_class(transformer_class):
 
         def forward(self, x, *args, **kwdargs) -> torch.Tensor:
             self._tome_info["r"] = parse_r(len(self.backbone.blocks), self.r)
-            self._tome_info["size"] = None
-            _, _, H, W = x.shape
-            self._tome_info["H"] = H // self.backbone.patch_size
-            self._tome_info["W"] = W // self.backbone.patch_size
+
+            if self._tome_info.get("trace_source", False):
+                self._tome_info["source"] = None
 
             return super().forward(x, *args, **kwdargs)
 
     return ToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer):
+def apply_patch(model: DinoVisionTransformer, trace_source: bool = False):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
-    If you want to know the source of each token (e.g., for visualization), set trace_source = true.
-    The sources will be available at model._tome_info["source"] afterward.
-
-    For proportional attention, set prop_attn to True. This is only necessary when evaluating models off
-    the shelf. For training and for evaluating MAE models off the self set this to be False.
+    If trace_source=True, the (unmerged) per-token source map will be available at:
+        model._tome_info["source"]   # shape: [B, N, N]
     """
     ToMeVisionTransformer = make_tome_class(model.__class__)
 
@@ -106,6 +113,8 @@ def apply_patch(model: DinoVisionTransformer):
     model._tome_info = {
         "r": model.r,
         "num_special_tokens": model.backbone.n_storage_tokens + 1,
+        "trace_source": trace_source,
+        "source": None,
     }
 
     for module in model.modules():
