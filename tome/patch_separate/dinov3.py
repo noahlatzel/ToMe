@@ -63,7 +63,13 @@ class ToMeAttention(SelfAttention):
         if rope is not None:
             q, k = self.apply_rope(q, k, rope)
 
-        r_q, r_k = self._tome_info["r"].pop(0)
+        r_entry = self._tome_info["r"].pop(0)
+        if isinstance(r_entry, (tuple, list)):
+            if len(r_entry) != 2:
+                raise ValueError(f"Expected (r_q, r_k), got {r_entry!r}")
+            r_q, r_k = r_entry
+        else:
+            r_q = r_k = int(r_entry)
 
         size = self._tome_info["size"]
 
@@ -121,6 +127,8 @@ class ToMeAttention(SelfAttention):
             rope[0] = sin
             rope[1] = cos
             size = self._tome_info["size"] = size_merged_q
+        else:
+            size_merged_k = size
 
         # attn_score: B, num_heads, N, N
         # size: B, N
