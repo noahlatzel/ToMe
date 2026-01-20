@@ -58,28 +58,46 @@ def bipartite_soft_matching(
             # Sort to ensure the class token is at the start
             unm_idx = unm_idx.sort(dim=1)[0]
 
+    def _expand_idx(idx: torch.Tensor, target_shape: list[int], extra_leading: int) -> torch.Tensor:
+        if extra_leading > 0:
+            insert_pos = idx.ndim - 2
+            for _ in range(extra_leading):
+                idx = idx.unsqueeze(insert_pos)
+        return idx.expand(*target_shape)
+
     def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
         src, dst = x[..., ::2, :], x[..., 1::2, :]
+        extra_leading = x.ndim - metric.ndim
+        if extra_leading < 0:
+            raise ValueError("merge expects input with >= metric dims.")
 
         unm_size = list(src.shape)
         unm_size[-2] = src.shape[-2] - r  # Unmerged Token
 
-        unm = src.gather(dim=-2, index=unm_idx.expand(*unm_size))  # ..., t/2 - r, c
+        unm = src.gather(dim=-2, index=_expand_idx(unm_idx, unm_size, extra_leading))  # ..., t/2 - r, c
         if mode != "prune":
             dst_size = list(src.shape)
             dst_size[-2] = r  # Merged Token
-            src = src.gather(dim=-2, index=src_idx.expand(*dst_size))  # ..., r, c
-            dst = dst.scatter_reduce(-2, dst_idx.expand(*dst_size), src, reduce=mode)  # ..., t/2, c
+            src = src.gather(dim=-2, index=_expand_idx(src_idx, dst_size, extra_leading))  # ..., r, c
+            dst = dst.scatter_reduce(
+                -2,
+                _expand_idx(dst_idx, dst_size, extra_leading),
+                src,
+                reduce=mode,
+            )  # ..., t/2, c
 
         return torch.cat([unm, dst], dim=-2)
 
     def unmerge(x: torch.Tensor) -> torch.Tensor:
+        extra_leading = x.ndim - metric.ndim
+        if extra_leading < 0:
+            raise ValueError("unmerge expects input with >= metric dims.")
         unm_len = unm_idx.shape[-2]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
 
         rc_size = list(x.shape)
         rc_size[-2] = r
-        src = dst.gather(dim=-2, index=dst_idx.expand(*rc_size))
+        src = dst.gather(dim=-2, index=_expand_idx(dst_idx, rc_size, extra_leading))
 
         out_size = list(x.shape)
         out_size[-2] = metric.shape[-2]
@@ -89,8 +107,8 @@ def bipartite_soft_matching(
 
         unm_size = list(x.shape)
         unm_size[-2] = unm_len
-        out.scatter_(dim=-2, index=(2 * unm_idx).expand(*unm_size), src=unm)
-        out.scatter_(dim=-2, index=(2 * src_idx).expand(*rc_size), src=src)
+        out.scatter_(dim=-2, index=_expand_idx(2 * unm_idx, unm_size, extra_leading), src=unm)
+        out.scatter_(dim=-2, index=_expand_idx(2 * src_idx, rc_size, extra_leading), src=src)
 
         return out
 
