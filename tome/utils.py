@@ -148,3 +148,17 @@ class PatchedDinov3(DinoVisionTransformer):
                 }
             )
         return output
+
+
+def init_source_if_needed(x: Tensor, source: Tensor | None) -> Tensor:
+    """
+    Create an identity source map for the current tokenization.
+
+    Returns a tensor of shape [B, N, N] that maps each token to itself.
+    """
+    if source is not None:
+        return source
+
+    batch_size, num_tokens, _ = x.shape
+    eye = torch.eye(num_tokens, device=x.device, dtype=x.dtype)
+    return eye.unsqueeze(0).expand(batch_size, -1, -1).contiguous()

@@ -23,6 +23,9 @@ class ToMeBlock(SelfAttentionBlock):
             x_norm1 = self.norm1(x)
             x_attn, merge, size, size_original = self.attn(x_norm1, rope=rope)
             if size is not None:
+                if self._tome_info["trace_source"]:
+                    self._tome_info["source"] = merge_source(merge, x, self._tome_info["source"])
+
                 x = merge(x * size_original, mode="sum")
                 x = x / size
             x = x + self.ls1(x_attn)
@@ -73,9 +76,7 @@ class ToMeAttention(SelfAttention):
                 r,
                 self._tome_info["num_special_tokens"],
             )
-            if self._tome_info["trace_source"]:
-                self._tome_info["source"] = merge_source(merge, k, self._tome_info["source"])
-            
+
             if size is None:
                 size = torch.ones(B, N, 1, device=k.device, dtype=k.dtype) # B, N, 1
             
@@ -172,6 +173,7 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, prop_a
     for module in model.modules():
         if isinstance(module, SelfAttentionBlock):
             module.__class__ = ToMeBlock
+            module._tome_info = model._tome_info
         elif isinstance(module, SelfAttention):
             module.__class__ = ToMeAttention
             module._tome_info = model._tome_info
