@@ -8,6 +8,31 @@ from tome.merge import bipartite_soft_matching
 from tome.utils import parse_r, PatchedDinov3, init_source_if_needed
 
 
+def _build_patch_permutation(
+    height: int | None,
+    width: int | None,
+    num_special_tokens: int,
+    num_tokens: int,
+    device: torch.device,
+    *,
+    use_column: bool,
+):
+    if not use_column:
+        return None, None
+    if height is None or width is None:
+        return None, None
+    patch_tokens = height * width
+    if num_tokens != num_special_tokens + patch_tokens:
+        return None, None
+
+    idx = torch.arange(patch_tokens, device=device)
+    idx = idx.view(height, width).t().reshape(-1)
+    perm = torch.cat([torch.arange(num_special_tokens, device=device), num_special_tokens + idx])
+    inv_perm = torch.empty_like(perm)
+    inv_perm[perm] = torch.arange(perm.numel(), device=device)
+    return perm, inv_perm
+
+
 class ToMeBlock(SelfAttentionBlock):
     def _forward_list(self, x_list: list[Tensor], rope_list=None) -> list[Tensor]:
         """
@@ -16,11 +41,35 @@ class ToMeBlock(SelfAttentionBlock):
         related to concat ops.
         """
         r = self._tome_info["r"].pop(0)
+        layer_idx = self._tome_info.get("layer_idx", 0)
+        self._tome_info["layer_idx"] = layer_idx + 1
+        pairing = str(self._tome_info.get("pairing", "row")).lower()
+        use_column = pairing == "column" or (pairing == "alternate" and (layer_idx % 2 == 1))
 
         x_out: list[Tensor] = []
         for x, rope in zip(x_list, rope_list):
             if r > 0:
+                perm, inv_perm = _build_patch_permutation(
+                    self._tome_info.get("H"),
+                    self._tome_info.get("W"),
+                    self._tome_info["num_special_tokens"],
+                    x.shape[-2],
+                    x.device,
+                    use_column=use_column,
+                )
+                use_perm = perm is not None
+
                 # Apply ToMe here
+                if self._tome_info.get("trace_source", False):
+                    source = init_source_if_needed(x, self._tome_info.get("source"))
+                    if use_perm and source is not None:
+                        source = source.index_select(1, perm)
+                else:
+                    source = None
+
+                if use_perm:
+                    x = x.index_select(-2, perm)
+
                 merge, unmerge = bipartite_soft_matching(
                     x,
                     r,
@@ -28,7 +77,6 @@ class ToMeBlock(SelfAttentionBlock):
                 )
 
                 if self._tome_info.get("trace_source", False):
-                    source = init_source_if_needed(x, self._tome_info.get("source"))
                     source = merge(source, mode="mean")
                     self._tome_info["source"] = source
 
@@ -49,6 +97,9 @@ class ToMeBlock(SelfAttentionBlock):
                 )
                 sin_extended = torch.cat([zeros_special, sin], dim=1)
                 cos_extended = torch.cat([zeros_special, cos], dim=1)
+                if use_perm:
+                    sin_extended = sin_extended.index_select(1, perm)
+                    cos_extended = cos_extended.index_select(1, perm)
                 sin = merge(sin_extended, mode="mean")
                 cos = merge(cos_extended, mode="mean")
                 sin = sin[:, None, self._tome_info["num_special_tokens"] :, :]
@@ -72,7 +123,13 @@ class ToMeBlock(SelfAttentionBlock):
                 if self._tome_info.get("trace_source", False):
                     source = self._tome_info.get("source")
                     if source is not None:
-                        self._tome_info["source"] = unmerge(source)
+                        source = unmerge(source)
+                        if use_perm:
+                            source = source.index_select(1, inv_perm)
+                        self._tome_info["source"] = source
+
+                if use_perm:
+                    x = x.index_select(-2, inv_perm)
 
             x_out.append(x)
         x_ffn = x_out
@@ -92,13 +149,18 @@ def make_tome_class(transformer_class):
 
             if self._tome_info.get("trace_source", False):
                 self._tome_info["source"] = None
+            self._tome_info["layer_idx"] = 0
+            _, _, height, width = x.shape
+            patch_size = self.backbone.patch_size
+            self._tome_info["H"] = height // patch_size
+            self._tome_info["W"] = width // patch_size
 
             return super().forward(x, *args, **kwdargs)
 
     return ToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer, trace_source: bool = False):
+def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, pairing: str = "alternate"):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
@@ -115,6 +177,7 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False):
         "num_special_tokens": model.backbone.n_storage_tokens + 1,
         "trace_source": trace_source,
         "source": None,
+        "pairing": pairing,
     }
 
     for module in model.modules():

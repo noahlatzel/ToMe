@@ -5,10 +5,12 @@ from torch.nn.functional import pad
 
 from tome.merge import do_nothing
 
-def get_checkerboard_mask(H, W):
+def get_checkerboard_mask(H, W, invert: bool = False):
     column = torch.tensor([True, False]).repeat(ceil(H / 2))[:H]
     row = torch.tensor([True, False]).repeat(ceil(W / 2))[:W]
     mask = torch.bitwise_xor(column[:, None], row[None, :])
+    if invert:
+        mask = ~mask
     return mask
 
 def spatial_soft_matching(
@@ -17,6 +19,7 @@ def spatial_soft_matching(
     W: int,
     r: int,
     num_special_tokens: int = 5,
+    invert_mask: bool = False,
 ) -> tuple[Callable, Callable]:
     """
     Applies ToMe with a balanced matching set (50%, 50%).
@@ -55,7 +58,7 @@ def spatial_soft_matching(
 
         # the source indices can either be merged with x or y, so we take the max
         max_scores, direction = torch.stack([scores_left, scores_right, scores_up, scores_down], dim=-1).max(dim=-1) # ..., H * W
-        mask = get_checkerboard_mask(H, W).flatten().to(metric.device)
+        mask = get_checkerboard_mask(H, W, invert=invert_mask).flatten().to(metric.device)
         left_idx = torch.where(mask)[0] + num_special_tokens
         right_idx = torch.where(~mask)[0] + num_special_tokens
 

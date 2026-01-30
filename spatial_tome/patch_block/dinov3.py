@@ -16,17 +16,21 @@ class SpatialToMeBlock(SelfAttentionBlock):
         related to concat ops.
         """
         r = self._tome_info["r"].pop(0)
+        layer_idx = self._tome_info.get("layer_idx", 0)
+        self._tome_info["layer_idx"] = layer_idx + 1
 
         x_out = []
         for x, rope in zip(x_list, rope_list):
             if r > 0:
                 # Apply ToMe here
+                invert_mask = bool(self._tome_info.get("alternate_mask", False) and (layer_idx % 2 == 1))
                 merge, unmerge = spatial_soft_matching(
                     x,
                     self._tome_info["H"],
                     self._tome_info["W"],
                     r,
                     self._tome_info["num_special_tokens"],
+                    invert_mask=invert_mask,
                 )
 
                 if self._tome_info.get("trace_source", False):
@@ -92,6 +96,7 @@ def make_spatial_tome_class(transformer_class):
             self._tome_info["size"] = None
             if self._tome_info.get("trace_source", False):
                 self._tome_info["source"] = None
+            self._tome_info["layer_idx"] = 0
 
             _, _, H, W = x.shape
             self._tome_info["H"] = H // self.backbone.patch_size
@@ -102,7 +107,7 @@ def make_spatial_tome_class(transformer_class):
     return SpatialToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer, trace_source: bool = False):
+def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, alternate_mask: bool = True):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
@@ -122,6 +127,7 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False):
         "num_special_tokens": model.backbone.n_storage_tokens + 1,
         "trace_source": trace_source,
         "source": None,
+        "alternate_mask": alternate_mask,
     }
 
     for module in model.modules():
