@@ -46,65 +46,78 @@ class ToMeBlock(SelfAttentionBlock):
         pairing = str(self._tome_info.get("pairing", "row")).lower()
         use_column = pairing == "column" or (pairing == "alternate" and (layer_idx % 2 == 1))
 
+        merge_passes = max(int(self._tome_info.get("merge_passes", 1)), 1)
         x_out: list[Tensor] = []
         for x, rope in zip(x_list, rope_list):
             if r > 0:
-                perm, inv_perm = _build_patch_permutation(
-                    self._tome_info.get("H"),
-                    self._tome_info.get("W"),
-                    self._tome_info["num_special_tokens"],
-                    x.shape[-2],
-                    x.device,
-                    use_column=use_column,
-                )
-                use_perm = perm is not None
+                unmerge_stack: list[tuple] = []
+                rope_local = rope
+                for pass_idx in range(merge_passes):
+                    perm = inv_perm = None
+                    use_perm = use_column and pass_idx == 0
+                    if use_perm:
+                        perm, inv_perm = _build_patch_permutation(
+                            self._tome_info.get("H"),
+                            self._tome_info.get("W"),
+                            self._tome_info["num_special_tokens"],
+                            x.shape[-2],
+                            x.device,
+                            use_column=use_column,
+                        )
+                        use_perm = perm is not None
 
-                # Apply ToMe here
-                if self._tome_info.get("trace_source", False):
-                    source = init_source_if_needed(x, self._tome_info.get("source"))
-                    if use_perm and source is not None:
-                        source = source.index_select(1, perm)
-                else:
-                    source = None
+                    # Apply ToMe here (first pass uses pairing/perm, later passes are generic)
+                    if self._tome_info.get("trace_source", False):
+                        source = init_source_if_needed(x, self._tome_info.get("source"))
+                        if use_perm and source is not None:
+                            source = source.index_select(1, perm)
+                    else:
+                        source = None
 
-                if use_perm:
-                    x = x.index_select(-2, perm)
+                    if use_perm:
+                        x = x.index_select(-2, perm)
 
-                merge, unmerge = bipartite_soft_matching(
-                    x,
-                    r,
-                    self._tome_info["num_special_tokens"],
-                )
+                    merge, unmerge = bipartite_soft_matching(
+                        x,
+                        r,
+                        self._tome_info["num_special_tokens"],
+                    )
 
-                if self._tome_info.get("trace_source", False):
-                    source = merge(source, mode="mean")
-                    self._tome_info["source"] = source
+                    if self._tome_info.get("trace_source", False):
+                        source = merge(source, mode="mean")
+                        self._tome_info["source"] = source
 
-                x = merge(x, mode="mean")
+                    x = merge(x, mode="mean")
 
-                sin, cos = rope
-                B = x.shape[0]
-                if sin.ndim == 2:
-                    sin = sin[None].expand(B, -1, -1)
-                if cos.ndim == 2:
-                    cos = cos[None].expand(B, -1, -1)
-                zeros_special = torch.zeros(
-                    B,
-                    self._tome_info["num_special_tokens"],
-                    sin.shape[2],
-                    device=sin.device,
-                    dtype=sin.dtype,
-                )
-                sin_extended = torch.cat([zeros_special, sin], dim=1)
-                cos_extended = torch.cat([zeros_special, cos], dim=1)
-                if use_perm:
-                    sin_extended = sin_extended.index_select(1, perm)
-                    cos_extended = cos_extended.index_select(1, perm)
-                sin = merge(sin_extended, mode="mean")
-                cos = merge(cos_extended, mode="mean")
-                sin = sin[:, None, self._tome_info["num_special_tokens"] :, :]
-                cos = cos[:, None, self._tome_info["num_special_tokens"] :, :]
-                rope_local = [sin, cos]
+                    sin, cos = rope_local
+                    B = x.shape[0]
+                    if sin.ndim == 4:
+                        sin = sin.squeeze(1)
+                    if cos.ndim == 4:
+                        cos = cos.squeeze(1)
+                    if sin.ndim == 2:
+                        sin = sin[None].expand(B, -1, -1)
+                    if cos.ndim == 2:
+                        cos = cos[None].expand(B, -1, -1)
+                    zeros_special = torch.zeros(
+                        B,
+                        self._tome_info["num_special_tokens"],
+                        sin.shape[2],
+                        device=sin.device,
+                        dtype=sin.dtype,
+                    )
+                    sin_extended = torch.cat([zeros_special, sin], dim=1)
+                    cos_extended = torch.cat([zeros_special, cos], dim=1)
+                    if use_perm:
+                        sin_extended = sin_extended.index_select(1, perm)
+                        cos_extended = cos_extended.index_select(1, perm)
+                    sin = merge(sin_extended, mode="mean")
+                    cos = merge(cos_extended, mode="mean")
+                    sin = sin[:, None, self._tome_info["num_special_tokens"] :, :]
+                    cos = cos[:, None, self._tome_info["num_special_tokens"] :, :]
+                    rope_local = [sin, cos]
+
+                    unmerge_stack.append((unmerge, use_perm, inv_perm))
             else:
                 rope_local = rope
 
@@ -117,19 +130,19 @@ class ToMeBlock(SelfAttentionBlock):
             x = x + self.ls2(x_mlp)
 
             if r > 0:
-                # Unmerge
-                x = unmerge(x)
+                for unmerge, use_perm, inv_perm in reversed(unmerge_stack):
+                    x = unmerge(x)
 
-                if self._tome_info.get("trace_source", False):
-                    source = self._tome_info.get("source")
-                    if source is not None:
-                        source = unmerge(source)
-                        if use_perm:
-                            source = source.index_select(1, inv_perm)
-                        self._tome_info["source"] = source
+                    if self._tome_info.get("trace_source", False):
+                        source = self._tome_info.get("source")
+                        if source is not None:
+                            source = unmerge(source)
+                            if use_perm:
+                                source = source.index_select(1, inv_perm)
+                            self._tome_info["source"] = source
 
-                if use_perm:
-                    x = x.index_select(-2, inv_perm)
+                    if use_perm:
+                        x = x.index_select(-2, inv_perm)
 
             x_out.append(x)
         x_ffn = x_out
@@ -160,7 +173,12 @@ def make_tome_class(transformer_class):
     return ToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, pairing: str = "alternate"):
+def apply_patch(
+    model: DinoVisionTransformer,
+    trace_source: bool = False,
+    pairing: str = "alternate",
+    merge_passes: int = 1,
+):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
@@ -178,6 +196,7 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, pairin
         "trace_source": trace_source,
         "source": None,
         "pairing": pairing,
+        "merge_passes": merge_passes,
     }
 
     for module in model.modules():

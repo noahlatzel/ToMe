@@ -5,6 +5,7 @@ from dinov3.layers.block import SelfAttentionBlock
 from dinov3.models.vision_transformer import DinoVisionTransformer
 
 from spatial_tome.merge import spatial_soft_matching
+from tome.merge import bipartite_soft_matching
 from tome.utils import parse_r, PatchedDinov3, init_source_if_needed
 
 
@@ -19,47 +20,64 @@ class SpatialToMeBlock(SelfAttentionBlock):
         layer_idx = self._tome_info.get("layer_idx", 0)
         self._tome_info["layer_idx"] = layer_idx + 1
 
+        merge_passes = max(int(self._tome_info.get("merge_passes", 1)), 1)
         x_out = []
         for x, rope in zip(x_list, rope_list):
             if r > 0:
-                # Apply ToMe here
-                invert_mask = bool(self._tome_info.get("alternate_mask", False) and (layer_idx % 2 == 1))
-                merge, unmerge = spatial_soft_matching(
-                    x,
-                    self._tome_info["H"],
-                    self._tome_info["W"],
-                    r,
-                    self._tome_info["num_special_tokens"],
-                    invert_mask=invert_mask,
-                )
+                unmerge_stack = []
+                rope_local = rope
+                for pass_idx in range(merge_passes):
+                    # First pass uses spatial matching; later passes fall back to generic matching.
+                    if pass_idx == 0:
+                        invert_mask = bool(self._tome_info.get("alternate_mask", False) and (layer_idx % 2 == 1))
+                        merge, unmerge = spatial_soft_matching(
+                            x,
+                            self._tome_info["H"],
+                            self._tome_info["W"],
+                            r,
+                            self._tome_info["num_special_tokens"],
+                            invert_mask=invert_mask,
+                        )
+                    else:
+                        merge, unmerge = bipartite_soft_matching(
+                            x,
+                            r,
+                            self._tome_info["num_special_tokens"],
+                        )
 
-                if self._tome_info.get("trace_source", False):
-                    source = init_source_if_needed(x, self._tome_info.get("source"))
-                    source = merge(source, mode="mean")
-                    self._tome_info["source"] = source
+                    if self._tome_info.get("trace_source", False):
+                        source = init_source_if_needed(x, self._tome_info.get("source"))
+                        source = merge(source, mode="mean")
+                        self._tome_info["source"] = source
 
-                x = merge(x, mode="mean")
+                    x = merge(x, mode="mean")
 
-                sin, cos = rope
-                B = x.shape[0]
-                if sin.ndim == 2:
-                    sin = sin[None].expand(B, -1, -1)
-                if cos.ndim == 2:
-                    cos = cos[None].expand(B, -1, -1)
-                zeros_special = torch.zeros(
-                    B,
-                    self._tome_info["num_special_tokens"],
-                    sin.shape[2],
-                    device=sin.device,
-                    dtype=sin.dtype,
-                )
-                sin_extended = torch.cat([zeros_special, sin], dim=1)
-                cos_extended = torch.cat([zeros_special, cos], dim=1)
-                sin = merge(sin_extended, mode="mean")
-                cos = merge(cos_extended, mode="mean")
-                sin = sin[:, None, self._tome_info["num_special_tokens"] :, :]
-                cos = cos[:, None, self._tome_info["num_special_tokens"] :, :]
-                rope_local = [sin, cos]
+                    sin, cos = rope_local
+                    B = x.shape[0]
+                    if sin.ndim == 4:
+                        sin = sin.squeeze(1)
+                    if cos.ndim == 4:
+                        cos = cos.squeeze(1)
+                    if sin.ndim == 2:
+                        sin = sin[None].expand(B, -1, -1)
+                    if cos.ndim == 2:
+                        cos = cos[None].expand(B, -1, -1)
+                    zeros_special = torch.zeros(
+                        B,
+                        self._tome_info["num_special_tokens"],
+                        sin.shape[2],
+                        device=sin.device,
+                        dtype=sin.dtype,
+                    )
+                    sin_extended = torch.cat([zeros_special, sin], dim=1)
+                    cos_extended = torch.cat([zeros_special, cos], dim=1)
+                    sin = merge(sin_extended, mode="mean")
+                    cos = merge(cos_extended, mode="mean")
+                    sin = sin[:, None, self._tome_info["num_special_tokens"] :, :]
+                    cos = cos[:, None, self._tome_info["num_special_tokens"] :, :]
+                    rope_local = [sin, cos]
+
+                    unmerge_stack.append(unmerge)
             else:
                 rope_local = rope
 
@@ -72,11 +90,11 @@ class SpatialToMeBlock(SelfAttentionBlock):
             x = x + self.ls2(x_mlp)
 
             if r > 0:
-                # Unmerge
-                x = unmerge(x)
+                for unmerge in reversed(unmerge_stack):
+                    x = unmerge(x)
 
-                if self._tome_info.get("trace_source", False):
-                    self._tome_info["source"] = unmerge(self._tome_info["source"])
+                    if self._tome_info.get("trace_source", False):
+                        self._tome_info["source"] = unmerge(self._tome_info["source"])
 
             x_out.append(x)
         x_ffn = x_out
@@ -107,7 +125,12 @@ def make_spatial_tome_class(transformer_class):
     return SpatialToMeVisionTransformer
 
 
-def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, alternate_mask: bool = True):
+def apply_patch(
+    model: DinoVisionTransformer,
+    trace_source: bool = False,
+    alternate_mask: bool = True,
+    merge_passes: int = 1,
+):
     """
     Applies ToMe to this transformer. Afterward, set r using model.r.
 
@@ -128,6 +151,7 @@ def apply_patch(model: DinoVisionTransformer, trace_source: bool = False, altern
         "trace_source": trace_source,
         "source": None,
         "alternate_mask": alternate_mask,
+        "merge_passes": merge_passes,
     }
 
     for module in model.modules():
