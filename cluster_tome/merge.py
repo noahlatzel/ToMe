@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from enum import Enum
 from typing import Callable, Tuple
 
 import torch
@@ -7,6 +8,27 @@ import torch
 
 def do_nothing(x, mode=None):
     return x
+
+
+class UnclusteredTokenMode(str, Enum):
+    MERGE = "merge"
+    NO_MERGE = "no_merge"
+
+    @classmethod
+    def coerce(cls, value: str | "UnclusteredTokenMode") -> "UnclusteredTokenMode":
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, Enum) and isinstance(value.value, str):
+            normalized = value.value.strip().lower()
+        else:
+            normalized = str(value).strip().lower()
+        for member in cls:
+            if member.value == normalized:
+                return member
+        valid = ", ".join(member.value for member in cls)
+        raise ValueError(
+            f"Unsupported unclustered token mode '{value}'. Expected one of: {valid}."
+        )
 
 
 def _normalize_cluster_tokens(
@@ -47,8 +69,8 @@ def _normalize_cluster_tokens(
         )
 
     labels = labels.to(dtype=torch.long)
-    if (labels < 0).any():
-        raise ValueError("cluster_labels must assign every patch to a non-negative cluster id.")
+    if (labels < -1).any():
+        raise ValueError("cluster_labels values must be -1 or non-negative cluster ids.")
     return labels
 
 
@@ -66,6 +88,7 @@ def cluster_bipartite_soft_matching(
     top_k: int,
     *,
     cluster_labels,
+    unclustered_token_mode: str | UnclusteredTokenMode = UnclusteredTokenMode.MERGE,
     num_special_tokens: int = 1,
 ) -> Tuple[Callable, Callable]:
     """
@@ -76,6 +99,7 @@ def cluster_bipartite_soft_matching(
     """
     if metric.ndim != 3:
         raise ValueError("cluster_bipartite_soft_matching expects metric shape [B, N, C].")
+    mode = UnclusteredTokenMode.coerce(unclustered_token_mode)
 
     alpha = float(alpha)
     if not (0.0 <= alpha <= 2.0):
@@ -116,7 +140,14 @@ def cluster_bipartite_soft_matching(
 
         scores = src_metric @ dst_metric.transpose(-1, -2)
         same_cluster = src_labels[:, :, None] == dst_labels[:, None, :]
-        scores = scores.masked_fill(~same_cluster, -torch.inf)
+        if mode is UnclusteredTokenMode.NO_MERGE:
+            src_is_unclustered = src_labels == -1
+            dst_is_unclustered = dst_labels == -1
+            disallow_unclustered = src_is_unclustered[:, :, None] | dst_is_unclustered[:, None, :]
+            allowed = same_cluster & ~disallow_unclustered
+        else:
+            allowed = same_cluster
+        scores = scores.masked_fill(~allowed, -torch.inf)
 
         node_max, node_idx = scores.max(dim=-1)
         sim_threshold = 1.0 - alpha

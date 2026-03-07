@@ -6,9 +6,15 @@ from torch import Tensor
 from dinov3.layers.attention import SelfAttention
 from dinov3.layers.block import SelfAttentionBlock
 
-from cluster_tome.merge import cluster_bipartite_soft_matching, do_nothing
+from cluster_tome.merge import (
+    UnclusteredTokenMode,
+    cluster_bipartite_soft_matching,
+    do_nothing,
+)
 from tome.merge import merge_source, merge_wavg
 from tome.utils import PatchedDinov3
+
+SPECIAL_LABEL_SENTINEL = -2
 
 
 def _prepare_initial_cluster_tokens(
@@ -60,8 +66,8 @@ def _prepare_initial_cluster_tokens(
         )
 
     labels = labels.to(dtype=torch.long)
-    if (labels < 0).any():
-        raise ValueError("cluster label map must assign every patch to a non-negative cluster id.")
+    if (labels < -1).any():
+        raise ValueError("cluster label map values must be -1 or non-negative cluster ids.")
     return labels
 
 
@@ -99,8 +105,8 @@ class ToMeClusterBlock(SelfAttentionBlock):
                             f"cluster token labels shape {tuple(cluster_tokens.shape)} does not match "
                             f"expected {(x.shape[0], expected_patches)}."
                         )
-                    if (cluster_tokens < 0).any():
-                        raise ValueError("cluster token labels must remain non-negative.")
+                    if (cluster_tokens < -1).any():
+                        raise ValueError("cluster token labels must stay >= -1.")
 
                 self._tome_info["cluster_tokens"] = cluster_tokens
                 merge, _ = cluster_bipartite_soft_matching(
@@ -108,6 +114,7 @@ class ToMeClusterBlock(SelfAttentionBlock):
                     alpha,
                     top_k,
                     cluster_labels=cluster_tokens,
+                    unclustered_token_mode=self._tome_info["unclustered_token_mode"],
                     num_special_tokens=num_special_tokens,
                 )
                 if merge is not do_nothing:
@@ -119,7 +126,7 @@ class ToMeClusterBlock(SelfAttentionBlock):
 
                     specials = torch.full(
                         (cluster_tokens.shape[0], num_special_tokens, 1),
-                        fill_value=-1.0,
+                        fill_value=float(SPECIAL_LABEL_SENTINEL),
                         device=x.device,
                         dtype=torch.float32,
                     )
@@ -208,6 +215,7 @@ def apply_patch(
     prop_attn: bool = True,
     alpha: float = 0.5,
     top_k: int = 0,
+    unclustered_token_mode: str | UnclusteredTokenMode = UnclusteredTokenMode.MERGE,
 ):
     alpha = float(alpha)
     if not (0.0 <= alpha <= 2.0):
@@ -215,6 +223,7 @@ def apply_patch(
     top_k = int(top_k)
     if top_k < 0:
         raise ValueError(f"top_k must be >= 0, got {top_k}.")
+    mode = UnclusteredTokenMode.coerce(unclustered_token_mode)
 
     ToMeVisionTransformer = make_tome_class(model.__class__)
 
@@ -222,6 +231,7 @@ def apply_patch(
     model.__class__ = ToMeVisionTransformer
     model.alpha = alpha
     model.top_k = top_k
+    model.unclustered_token_mode = mode.value
     model._tome_info = {
         "size": None,
         "source": None,
@@ -232,6 +242,7 @@ def apply_patch(
         "cluster_tokens": None,
         "alpha": alpha,
         "top_k": top_k,
+        "unclustered_token_mode": mode.value,
     }
 
     for module in model.modules():
