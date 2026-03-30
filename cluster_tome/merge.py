@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, Tuple
 
@@ -29,6 +30,17 @@ class UnclusteredTokenMode(str, Enum):
         raise ValueError(
             f"Unsupported unclustered token mode '{value}'. Expected one of: {valid}."
         )
+
+
+@dataclass(frozen=True)
+class ClusterMergeAssignment:
+    src_idx: torch.Tensor
+    dst_idx: torch.Tensor
+    unm_idx: torch.Tensor
+    k_effective: int
+    total_tokens: int
+    patch_tokens: int
+    num_special_tokens: int
 
 
 def _normalize_cluster_tokens(
@@ -233,5 +245,17 @@ def cluster_bipartite_soft_matching(
             src=src_vals,
         )
         return torch.cat([special, out_patch], dim=-2)
+
+    assignment = ClusterMergeAssignment(
+        src_idx=src_idx,
+        dst_idx=dst_idx,
+        unm_idx=unm_idx,
+        k_effective=k_effective,
+        total_tokens=total_tokens,
+        patch_tokens=patch_tokens,
+        num_special_tokens=num_special_tokens,
+    )
+    merge.assignment = assignment
+    unmerge.assignment = assignment
 
     return merge, unmerge

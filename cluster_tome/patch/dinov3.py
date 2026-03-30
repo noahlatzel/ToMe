@@ -17,6 +17,17 @@ from tome.utils import PatchedDinov3
 SPECIAL_LABEL_SENTINEL = -2
 
 
+def _propagate_cluster_tokens_from_assignment(
+    cluster_tokens: torch.Tensor,
+    assignment: object,
+) -> torch.Tensor:
+    src_labels = cluster_tokens[:, ::2]
+    dst_labels = cluster_tokens[:, 1::2]
+    unm_idx = assignment.unm_idx.squeeze(-1)
+    unm_labels = src_labels.gather(dim=1, index=unm_idx)
+    return torch.cat([unm_labels, dst_labels], dim=1)
+
+
 def _prepare_initial_cluster_tokens(
     cluster_map,
     *,
@@ -118,23 +129,13 @@ class ToMeClusterBlock(SelfAttentionBlock):
                     num_special_tokens=num_special_tokens,
                 )
                 if merge is not do_nothing:
+                    assignment = getattr(merge, "assignment", None)
+                    prev_size = self._tome_info["size"]
                     if self._tome_info["trace_source"]:
                         self._tome_info["source"] = merge_source(
                             merge, x, self._tome_info["source"]
                         )
-                    x, size = merge_wavg(merge, x, self._tome_info["size"])
-
-                    specials = torch.full(
-                        (cluster_tokens.shape[0], num_special_tokens, 1),
-                        fill_value=float(SPECIAL_LABEL_SENTINEL),
-                        device=x.device,
-                        dtype=torch.float32,
-                    )
-                    cluster_full = torch.cat([specials, cluster_tokens[..., None].float()], dim=1)
-                    cluster_full = merge(cluster_full, mode="amax")
-                    self._tome_info["cluster_tokens"] = cluster_full[:, num_special_tokens:, 0].to(
-                        torch.long
-                    )
+                    x, size = merge_wavg(merge, x, prev_size)
 
                     sin, cos = rope
                     batch = x.shape[0]
@@ -152,8 +153,26 @@ class ToMeClusterBlock(SelfAttentionBlock):
                     )
                     sin_extended = torch.cat([zeros_special, sin], dim=1)
                     cos_extended = torch.cat([zeros_special, cos], dim=1)
-                    sin, _ = merge_wavg(merge, sin_extended, self._tome_info["size"])
-                    cos, _ = merge_wavg(merge, cos_extended, self._tome_info["size"])
+                    if assignment is None:
+                        specials = torch.full(
+                            (cluster_tokens.shape[0], num_special_tokens, 1),
+                            fill_value=float(SPECIAL_LABEL_SENTINEL),
+                            device=x.device,
+                            dtype=torch.float32,
+                        )
+                        cluster_full = torch.cat([specials, cluster_tokens[..., None].float()], dim=1)
+                        cluster_full = merge(cluster_full, mode="amax")
+                        self._tome_info["cluster_tokens"] = cluster_full[:, num_special_tokens:, 0].to(
+                            torch.long
+                        )
+                    else:
+                        self._tome_info["cluster_tokens"] = _propagate_cluster_tokens_from_assignment(
+                            cluster_tokens,
+                            assignment,
+                        )
+
+                    sin, _ = merge_wavg(merge, sin_extended, prev_size, merged_size=size)
+                    cos, _ = merge_wavg(merge, cos_extended, prev_size, merged_size=size)
                     sin = sin[:, num_special_tokens:, :]
                     cos = cos[:, num_special_tokens:, :]
                     rope[0] = sin

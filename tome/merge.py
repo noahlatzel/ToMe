@@ -221,7 +221,12 @@ def random_bipartite_soft_matching(metric: torch.Tensor, r: int) -> Tuple[Callab
     return merge, unmerge
 
 
-def merge_wavg(merge: Callable, x: torch.Tensor, size: torch.Tensor = None) -> Tuple[torch.Tensor, torch.Tensor]:
+def merge_wavg(
+    merge: Callable,
+    x: torch.Tensor,
+    size: torch.Tensor = None,
+    merged_size: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Applies the merge function by taking a weighted average based on token size.
     Returns the merged tensor and the new token sizes.
@@ -230,10 +235,11 @@ def merge_wavg(merge: Callable, x: torch.Tensor, size: torch.Tensor = None) -> T
         size = torch.ones_like(x[..., 0, None])
 
     x = merge(x * size, mode="sum")
-    size = merge(size, mode="sum")
+    if merged_size is None:
+        merged_size = merge(size, mode="sum")
 
-    x = x / size
-    return x, size
+    x = x / merged_size
+    return x, merged_size
 
 
 def merge_source(merge: Callable, x: torch.Tensor, source: torch.Tensor = None) -> torch.Tensor:
