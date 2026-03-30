@@ -138,6 +138,7 @@ def cluster_bipartite_soft_matching(
         src_labels = labels[:, ::2]
         dst_labels = labels[:, 1::2]
 
+        sim_threshold = 1.0 - alpha
         scores = src_metric @ dst_metric.transpose(-1, -2)
         same_cluster = src_labels[:, :, None] == dst_labels[:, None, :]
         if mode is UnclusteredTokenMode.NO_MERGE:
@@ -150,29 +151,24 @@ def cluster_bipartite_soft_matching(
         scores = scores.masked_fill(~allowed, -torch.inf)
 
         node_max, node_idx = scores.max(dim=-1)
-        sim_threshold = 1.0 - alpha
-        eligible = torch.isfinite(node_max) & (node_max >= sim_threshold)
-        eligible_counts = eligible.sum(dim=-1)
-
-        k_effective = min(int(eligible_counts.min().item()), top_k)
-        if k_effective <= 0:
+        candidate_scores = node_max.masked_fill(~torch.isfinite(node_max) | (node_max < sim_threshold), -torch.inf)
+        top_scores, src_idx = candidate_scores.topk(k=top_k, dim=-1, largest=True, sorted=True)
+        shared_valid = torch.isfinite(top_scores).all(dim=0)
+        src_idx = src_idx[:, shared_valid]
+        if src_idx.shape[1] == 0:
             return do_nothing, do_nothing
-
-        src_count = src_metric.shape[-2]
-        candidate_scores = node_max.masked_fill(~eligible, -torch.inf)
-        src_idx = candidate_scores.argsort(dim=-1, descending=True)[:, :k_effective]
         dst_idx = node_idx.gather(dim=-1, index=src_idx)
-
-        keep_mask = torch.ones(batch_size, src_count, dtype=torch.bool, device=metric.device)
-        keep_mask.scatter_(1, src_idx, False)
-
-        unm_rows = [
-            torch.nonzero(keep_mask[b_idx], as_tuple=False).squeeze(1)
-            for b_idx in range(batch_size)
-        ]
-        unm_idx = torch.stack(unm_rows, dim=0)[..., None]
+        k_effective = src_idx.shape[1]
         src_idx = src_idx[..., None]
         dst_idx = dst_idx[..., None]
+        src_count = src_metric.shape[-2]
+        src_positions = torch.arange(src_count, device=metric.device).expand(batch_size, -1)
+        keep_mask = torch.ones(batch_size, src_count, dtype=torch.bool, device=metric.device)
+        keep_mask.scatter_(1, src_idx.squeeze(-1), False)
+        unm_idx = src_positions.masked_select(keep_mask).reshape(
+            batch_size,
+            src_count - k_effective,
+        )[..., None]
 
     def merge(x: torch.Tensor, mode: str = "mean") -> torch.Tensor:
         if x.shape[-2] != total_tokens:
