@@ -41,6 +41,52 @@ class ClusterMergeAssignment:
     total_tokens: int
     patch_tokens: int
     num_special_tokens: int
+    single_cluster_label: int | None = None
+
+
+def _build_assignment(
+    *,
+    node_max: torch.Tensor,
+    node_idx: torch.Tensor,
+    sim_threshold: float,
+    top_k: int,
+    total_tokens: int,
+    patch_tokens: int,
+    num_special_tokens: int,
+    single_cluster_label: int | None = None,
+) -> ClusterMergeAssignment | None:
+    candidate_scores = node_max.masked_fill(
+        ~torch.isfinite(node_max) | (node_max < sim_threshold),
+        -torch.inf,
+    )
+    top_scores, src_idx = candidate_scores.topk(k=top_k, dim=-1, largest=True, sorted=True)
+    shared_valid = torch.isfinite(top_scores).all(dim=0)
+    src_idx = src_idx[:, shared_valid]
+    if src_idx.shape[1] == 0:
+        return None
+
+    dst_idx = node_idx.gather(dim=-1, index=src_idx)
+    k_effective = src_idx.shape[1]
+    src_idx = src_idx[..., None]
+    dst_idx = dst_idx[..., None]
+    src_count = node_max.shape[-1]
+    src_positions = torch.arange(src_count, device=node_max.device).expand(node_max.shape[0], -1)
+    keep_mask = torch.ones(node_max.shape[0], src_count, dtype=torch.bool, device=node_max.device)
+    keep_mask.scatter_(1, src_idx.squeeze(-1), False)
+    unm_idx = src_positions.masked_select(keep_mask).reshape(
+        node_max.shape[0],
+        src_count - k_effective,
+    )[..., None]
+    return ClusterMergeAssignment(
+        src_idx=src_idx,
+        dst_idx=dst_idx,
+        unm_idx=unm_idx,
+        k_effective=k_effective,
+        total_tokens=total_tokens,
+        patch_tokens=patch_tokens,
+        num_special_tokens=num_special_tokens,
+        single_cluster_label=single_cluster_label,
+    )
 
 
 def _normalize_cluster_tokens(
@@ -132,12 +178,26 @@ def cluster_bipartite_soft_matching(
         return do_nothing, do_nothing
 
     with torch.no_grad():
-        labels = _normalize_cluster_tokens(
-            cluster_labels,
-            batch_size=batch_size,
-            patch_tokens=patch_tokens,
-            device=metric.device,
-        )
+        single_cluster_label: int | None = None
+        labels: torch.Tensor | None
+        labels_raw = torch.as_tensor(cluster_labels, device=metric.device)
+        if labels_raw.ndim == 0:
+            label_value = int(labels_raw.item())
+            if label_value < 0:
+                raise ValueError("single-cluster scalar labels must be non-negative.")
+            single_cluster_label = label_value if mode is UnclusteredTokenMode.MERGE else None
+            labels = None
+        else:
+            labels = _normalize_cluster_tokens(
+                cluster_labels,
+                batch_size=batch_size,
+                patch_tokens=patch_tokens,
+                device=metric.device,
+            )
+            if mode is UnclusteredTokenMode.MERGE:
+                label_min, label_max = torch.aminmax(labels)
+                if bool(label_min >= 0) and bool(label_min == label_max):
+                    single_cluster_label = int(label_min.item())
 
         metric_patch = metric[:, num_special_tokens:, :]
         metric_patch = metric_patch / metric_patch.norm(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -147,40 +207,41 @@ def cluster_bipartite_soft_matching(
         if dst_metric.shape[1] == 0:
             return do_nothing, do_nothing
 
-        src_labels = labels[:, ::2]
-        dst_labels = labels[:, 1::2]
-
         sim_threshold = 1.0 - alpha
-        scores = src_metric @ dst_metric.transpose(-1, -2)
-        same_cluster = src_labels[:, :, None] == dst_labels[:, None, :]
-        if mode is UnclusteredTokenMode.NO_MERGE:
-            src_is_unclustered = src_labels == -1
-            dst_is_unclustered = dst_labels == -1
-            disallow_unclustered = src_is_unclustered[:, :, None] | dst_is_unclustered[:, None, :]
-            allowed = same_cluster & ~disallow_unclustered
+        if single_cluster_label is not None:
+            scores = src_metric @ dst_metric.transpose(-1, -2)
         else:
-            allowed = same_cluster
-        scores = scores.masked_fill(~allowed, -torch.inf)
+            assert labels is not None
+            src_labels = labels[:, ::2]
+            dst_labels = labels[:, 1::2]
+            scores = src_metric @ dst_metric.transpose(-1, -2)
+            same_cluster = src_labels[:, :, None] == dst_labels[:, None, :]
+            if mode is UnclusteredTokenMode.NO_MERGE:
+                src_is_unclustered = src_labels == -1
+                dst_is_unclustered = dst_labels == -1
+                disallow_unclustered = src_is_unclustered[:, :, None] | dst_is_unclustered[:, None, :]
+                allowed = same_cluster & ~disallow_unclustered
+            else:
+                allowed = same_cluster
+            scores = scores.masked_fill(~allowed, -torch.inf)
 
         node_max, node_idx = scores.max(dim=-1)
-        candidate_scores = node_max.masked_fill(~torch.isfinite(node_max) | (node_max < sim_threshold), -torch.inf)
-        top_scores, src_idx = candidate_scores.topk(k=top_k, dim=-1, largest=True, sorted=True)
-        shared_valid = torch.isfinite(top_scores).all(dim=0)
-        src_idx = src_idx[:, shared_valid]
-        if src_idx.shape[1] == 0:
+        assignment = _build_assignment(
+            node_max=node_max,
+            node_idx=node_idx,
+            sim_threshold=sim_threshold,
+            top_k=top_k,
+            total_tokens=total_tokens,
+            patch_tokens=patch_tokens,
+            num_special_tokens=num_special_tokens,
+            single_cluster_label=single_cluster_label,
+        )
+        if assignment is None:
             return do_nothing, do_nothing
-        dst_idx = node_idx.gather(dim=-1, index=src_idx)
-        k_effective = src_idx.shape[1]
-        src_idx = src_idx[..., None]
-        dst_idx = dst_idx[..., None]
-        src_count = src_metric.shape[-2]
-        src_positions = torch.arange(src_count, device=metric.device).expand(batch_size, -1)
-        keep_mask = torch.ones(batch_size, src_count, dtype=torch.bool, device=metric.device)
-        keep_mask.scatter_(1, src_idx.squeeze(-1), False)
-        unm_idx = src_positions.masked_select(keep_mask).reshape(
-            batch_size,
-            src_count - k_effective,
-        )[..., None]
+        src_idx = assignment.src_idx
+        dst_idx = assignment.dst_idx
+        unm_idx = assignment.unm_idx
+        k_effective = assignment.k_effective
 
     def merge(x: torch.Tensor, mode: str = "mean") -> torch.Tensor:
         if x.shape[-2] != total_tokens:
@@ -246,15 +307,6 @@ def cluster_bipartite_soft_matching(
         )
         return torch.cat([special, out_patch], dim=-2)
 
-    assignment = ClusterMergeAssignment(
-        src_idx=src_idx,
-        dst_idx=dst_idx,
-        unm_idx=unm_idx,
-        k_effective=k_effective,
-        total_tokens=total_tokens,
-        patch_tokens=patch_tokens,
-        num_special_tokens=num_special_tokens,
-    )
     merge.assignment = assignment
     unmerge.assignment = assignment
 

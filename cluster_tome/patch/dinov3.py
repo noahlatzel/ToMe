@@ -21,11 +21,27 @@ def _propagate_cluster_tokens_from_assignment(
     cluster_tokens: torch.Tensor,
     assignment: object,
 ) -> torch.Tensor:
+    single_cluster_label = getattr(assignment, "single_cluster_label", None)
+    if single_cluster_label is not None:
+        next_patch_tokens = cluster_tokens.shape[1] - assignment.k_effective
+        return cluster_tokens.new_full(
+            (cluster_tokens.shape[0], next_patch_tokens),
+            fill_value=int(single_cluster_label),
+        )
     src_labels = cluster_tokens[:, ::2]
     dst_labels = cluster_tokens[:, 1::2]
     unm_idx = assignment.unm_idx.squeeze(-1)
     unm_labels = src_labels.gather(dim=1, index=unm_idx)
     return torch.cat([unm_labels, dst_labels], dim=1)
+
+
+def _maybe_single_cluster_label(cluster_tokens: torch.Tensor) -> int | None:
+    if cluster_tokens.numel() == 0:
+        return None
+    label_min, label_max = torch.aminmax(cluster_tokens)
+    if bool(label_min >= 0) and bool(label_min == label_max):
+        return int(label_min.item())
+    return None
 
 
 def _merge_weighted_rope_pair(
@@ -97,6 +113,32 @@ def _prepare_initial_cluster_tokens(
     return labels
 
 
+def _prepare_initial_cluster_state(
+    cluster_map,
+    *,
+    batch_size: int,
+    patch_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor | None, int | None]:
+    cluster_map_t = torch.as_tensor(cluster_map, device=device)
+    if cluster_map_t.ndim == 0:
+        label_value = int(cluster_map_t.item())
+        if label_value < 0:
+            raise ValueError("single-cluster scalar labels must be non-negative.")
+        return None, label_value
+
+    cluster_tokens = _prepare_initial_cluster_tokens(
+        cluster_map,
+        batch_size=batch_size,
+        patch_tokens=patch_tokens,
+        device=device,
+    )
+    single_cluster_label = _maybe_single_cluster_label(cluster_tokens)
+    if single_cluster_label is not None:
+        return None, single_cluster_label
+    return cluster_tokens, None
+
+
 class ToMeClusterBlock(SelfAttentionBlock):
     def _forward_list(self, x_list: list[Tensor], rope_list=None) -> list[Tensor]:
         attn_size = self._tome_info["size"] if self._tome_info["prop_attn"] else None
@@ -112,34 +154,37 @@ class ToMeClusterBlock(SelfAttentionBlock):
             if top_k > 0:
                 num_special_tokens = self._tome_info["num_special_tokens"]
                 cluster_tokens = self._tome_info.get("cluster_tokens")
-                if cluster_tokens is None:
-                    cluster_tokens = _prepare_initial_cluster_tokens(
+                single_cluster_label = self._tome_info.get("single_cluster_label")
+                if cluster_tokens is None and single_cluster_label is None:
+                    cluster_tokens, single_cluster_label = _prepare_initial_cluster_state(
                         self._tome_info.get("cluster_map"),
                         batch_size=x.shape[0],
                         patch_tokens=x.shape[1] - num_special_tokens,
                         device=x.device,
                     )
                 else:
-                    cluster_tokens = torch.as_tensor(cluster_tokens, device=x.device, dtype=torch.long)
-                    if cluster_tokens.ndim == 1:
-                        cluster_tokens = cluster_tokens.reshape(1, -1)
-                    if cluster_tokens.shape[0] == 1 and x.shape[0] > 1:
-                        cluster_tokens = cluster_tokens.expand(x.shape[0], -1)
-                    expected_patches = x.shape[1] - num_special_tokens
-                    if cluster_tokens.shape != (x.shape[0], expected_patches):
-                        raise ValueError(
-                            f"cluster token labels shape {tuple(cluster_tokens.shape)} does not match "
-                            f"expected {(x.shape[0], expected_patches)}."
-                        )
-                    if (cluster_tokens < -1).any():
-                        raise ValueError("cluster token labels must stay >= -1.")
+                    if cluster_tokens is not None:
+                        cluster_tokens = torch.as_tensor(cluster_tokens, device=x.device, dtype=torch.long)
+                        if cluster_tokens.ndim == 1:
+                            cluster_tokens = cluster_tokens.reshape(1, -1)
+                        if cluster_tokens.shape[0] == 1 and x.shape[0] > 1:
+                            cluster_tokens = cluster_tokens.expand(x.shape[0], -1)
+                        expected_patches = x.shape[1] - num_special_tokens
+                        if cluster_tokens.shape != (x.shape[0], expected_patches):
+                            raise ValueError(
+                                f"cluster token labels shape {tuple(cluster_tokens.shape)} does not match "
+                                f"expected {(x.shape[0], expected_patches)}."
+                            )
+                        if (cluster_tokens < -1).any():
+                            raise ValueError("cluster token labels must stay >= -1.")
 
                 self._tome_info["cluster_tokens"] = cluster_tokens
+                self._tome_info["single_cluster_label"] = single_cluster_label
                 merge, _ = cluster_bipartite_soft_matching(
                     metric,
                     alpha,
                     top_k,
-                    cluster_labels=cluster_tokens,
+                    cluster_labels=single_cluster_label if single_cluster_label is not None else cluster_tokens,
                     unclustered_token_mode=self._tome_info["unclustered_token_mode"],
                     num_special_tokens=num_special_tokens,
                 )
@@ -169,6 +214,7 @@ class ToMeClusterBlock(SelfAttentionBlock):
                     sin_extended = torch.cat([zeros_special, sin], dim=1)
                     cos_extended = torch.cat([zeros_special, cos], dim=1)
                     if assignment is None:
+                        assert cluster_tokens is not None
                         specials = torch.full(
                             (cluster_tokens.shape[0], num_special_tokens, 1),
                             fill_value=float(SPECIAL_LABEL_SENTINEL),
@@ -180,11 +226,20 @@ class ToMeClusterBlock(SelfAttentionBlock):
                         self._tome_info["cluster_tokens"] = cluster_full[:, num_special_tokens:, 0].to(
                             torch.long
                         )
-                    else:
-                        self._tome_info["cluster_tokens"] = _propagate_cluster_tokens_from_assignment(
-                            cluster_tokens,
-                            assignment,
+                        self._tome_info["single_cluster_label"] = _maybe_single_cluster_label(
+                            self._tome_info["cluster_tokens"]
                         )
+                    else:
+                        if assignment.single_cluster_label is not None:
+                            self._tome_info["cluster_tokens"] = None
+                            self._tome_info["single_cluster_label"] = assignment.single_cluster_label
+                        else:
+                            assert cluster_tokens is not None
+                            self._tome_info["cluster_tokens"] = _propagate_cluster_tokens_from_assignment(
+                                cluster_tokens,
+                                assignment,
+                            )
+                            self._tome_info["single_cluster_label"] = None
 
                     sin, cos = _merge_weighted_rope_pair(
                         merge,
@@ -243,6 +298,7 @@ def make_tome_class(transformer_class):
             self._tome_info["size"] = None
             self._tome_info["source"] = None
             self._tome_info["cluster_tokens"] = None
+            self._tome_info["single_cluster_label"] = None
             return super().forward(*args, **kwdargs)
 
     return ToMeVisionTransformer
@@ -279,6 +335,7 @@ def apply_patch(
         "num_special_tokens": model.backbone.n_storage_tokens + 1,
         "cluster_map": None,
         "cluster_tokens": None,
+        "single_cluster_label": None,
         "alpha": alpha,
         "top_k": top_k,
         "unclustered_token_mode": mode.value,
