@@ -28,6 +28,21 @@ def _propagate_cluster_tokens_from_assignment(
     return torch.cat([unm_labels, dst_labels], dim=1)
 
 
+def _merge_weighted_rope_pair(
+    merge,
+    sin: torch.Tensor,
+    cos: torch.Tensor,
+    size: torch.Tensor | None,
+    merged_size: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if size is None:
+        size = torch.ones_like(sin[..., 0, None])
+
+    merged = merge(torch.cat([sin * size, cos * size], dim=-1), mode="sum")
+    sin_sum, cos_sum = torch.split(merged, [sin.shape[-1], cos.shape[-1]], dim=-1)
+    return sin_sum / merged_size, cos_sum / merged_size
+
+
 def _prepare_initial_cluster_tokens(
     cluster_map,
     *,
@@ -171,8 +186,13 @@ class ToMeClusterBlock(SelfAttentionBlock):
                             assignment,
                         )
 
-                    sin, _ = merge_wavg(merge, sin_extended, prev_size, merged_size=size)
-                    cos, _ = merge_wavg(merge, cos_extended, prev_size, merged_size=size)
+                    sin, cos = _merge_weighted_rope_pair(
+                        merge,
+                        sin_extended,
+                        cos_extended,
+                        prev_size,
+                        size,
+                    )
                     sin = sin[:, num_special_tokens:, :]
                     cos = cos[:, num_special_tokens:, :]
                     rope[0] = sin
