@@ -59,7 +59,10 @@ def _build_assignment(
         ~torch.isfinite(node_max) | (node_max < sim_threshold),
         -torch.inf,
     )
-    top_scores, src_idx = candidate_scores.topk(k=top_k, dim=-1, largest=True, sorted=True)
+    k = min(top_k, candidate_scores.shape[-1])
+    if k == 0:
+        return None
+    top_scores, src_idx = candidate_scores.topk(k=k, dim=-1, largest=True, sorted=True)
     shared_valid = torch.isfinite(top_scores).all(dim=0)
     src_idx = src_idx[:, shared_valid]
     if src_idx.shape[1] == 0:
